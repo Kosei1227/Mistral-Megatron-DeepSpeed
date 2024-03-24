@@ -20,7 +20,7 @@ from .transformer import ParallelTransformerLayerPipe, LMHeadPipe
 from deepspeed.pipe import PipelineModule, LayerSpec, TiedLayerSpec
 
 
-try:         
+try:
     from deepspeed.checkpoint import (
         VOCABULARY_PARAMETER_PATTERNS,
         PIPELINE_REPLICATED_PARAMETER_PATTERNS,
@@ -28,9 +28,9 @@ try:
         PARAMETER_WITH_ROW_PARALLELISM_PATTERNS,
         PARAMETER_WITH_2_SUB_PARAMS_CAT_DIM_0,
     )
-    DS_UNIVERSAL_CHECKPOINT_INFO = True 
+    DS_UNIVERSAL_CHECKPOINT_INFO = True
 except ImportError:
-    DS_UNIVERSAL_CHECKPOINT_INFO = False  
+    DS_UNIVERSAL_CHECKPOINT_INFO = False
 
 
 def post_language_model_processing(lm_output, labels, logit_weights,
@@ -309,7 +309,7 @@ def CrossEntropy(output, labels):
     return loss
 
 
-class GPTModelPipe(PipelineModule,MegatronModule):
+class GPTModelPipe(PipelineModule, MegatronModule):
     """GPT-2 Language model."""
 
     def __init__(self,
