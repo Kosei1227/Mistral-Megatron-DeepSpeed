@@ -370,7 +370,7 @@ class FlashSelfAttention(torch.nn.Module):
                            (default: 0.0)
     """
     def __init__(self, causal=False, softmax_scale=None, attention_dropout=0.0,
-                 window_size=(-1, 1), block_table=None,
+                 window_size=(-1, 1), paged_kv_block_size=None,
                  device=None, dtype=None):
         super().__init__()
         assert flash_attn_unpadded_func is not None or flash_attn_varlen_func is not None or flash_attn_builder is not None, \
@@ -384,7 +384,7 @@ class FlashSelfAttention(torch.nn.Module):
         args = get_args()
         self.flash_attn_func = flash_attn_varlen_func if args.use_flash_attn_v2 else flash_attn_unpadded_func
         self.window_size = window_size
-        self.block_table = block_table
+        self.paged_kv_block_size = paged_kv_block_size
 
     def forward(self, q, k, v):
         """Implements the multihead softmax attention.
@@ -427,13 +427,23 @@ class FlashSelfAttention(torch.nn.Module):
                                         device=q.device) if get_accelerator().device_name() == 'cuda' else None
             dropout_p = 0
 
+        if self.paged_kv_block_size:
+            num_blocks = math.ceil(seqlen_k / self.paged_kv_block_size) * batch_size
+            block_table = rearrange(
+                torch.randperm(num_blocks, dtype=torch.int32, device=get_accelerator().device_name()),
+                "(b nblocks) -> b nblocks",
+                b=batch_size,
+            )
+        else:
+            block_table = None
+
         if self.flac_attn_func == flash_attn_varlen_func:
             output = self.flash_attn_func(
                 q, k, v, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen_k,
                 dropout_p,
-                softmax_scale=self.softmax_scale, causal=is_causal, window_size=self.window_size, block_table=self.block_table
+                softmax_scale=self.softmax_scale, causal=is_causal, window_size=self.window_size, block_table=block_table
             ) if get_accelerator().device_name() == 'cuda' else flash_attn_builder.flash_attn_func(
-                q, k, v, self.dropout_p, self.softmax_scale, is_causal, window_size=self.window_size, block_table=self.block_table
+                q, k, v, self.dropout_p, self.softmax_scale, is_causal, window_size=self.window_size, block_table=block_table
             )
         else:
             output = self.flash_attn_func(
@@ -484,6 +494,7 @@ class FlashSelfAttentionTriton(torch.nn.Module):
         output = flash_attn_func(q, k, v, None, self.causal, window_size=self.window_size)
         output = rearrange(output, 'b s h d -> s b (h d)').contiguous()
         return output
+
 
 class ParallelAttention(MegatronModule):
     """Parallel self-attention layer abstract class.
@@ -583,7 +594,8 @@ class ParallelAttention(MegatronModule):
         if self.use_flash_attn_triton:
             local_attn = FlashSelfAttentionTriton(causal=True, attention_dropout=args.attention_dropout, window_size=self.window_size)
         elif self.use_flash_attn:
-            local_attn = FlashSelfAttention(causal=True, attention_dropout=config.attention_dropout, window_size=self.window_size, block_table=self.block_table)
+            local_attn = FlashSelfAttention(causal=True, attention_dropout=config.attention_dropout,
+                                            window_size=self.window_size, paged_kv_block_size=config.paged_kv_block_size)
         else:
             local_attn = CoreAttention(self.layer_number, config, self.attn_mask_type)
 
@@ -612,8 +624,6 @@ class ParallelAttention(MegatronModule):
 
         # Sliding Window Attention
         self.window_size = (config.window_size, config.window_size)
-        # Paged Attention
-        self.block_table = block_table
 
     def _checkpointed_attention_forward(self, query_layer, key_layer,
                                         value_layer, attention_mask,
@@ -915,7 +925,6 @@ class ParallelTransformerLayer(MegatronModule):
         else:
             self.input_layernorm = RMSNorm(config.hidden_size, config.layernorm_epsilon)
 
-        self.paged_kv_block_size = config.paged_kv_block_size
         # Self attention.
         self.self_attention = ParallelAttention(
             config,
@@ -1223,18 +1232,6 @@ class ParallelTransformerLayer(MegatronModule):
 
         return retriever_output, layernorm_input, layernorm_output
 
-    def compute_block_table(self, hidden_states):
-        if self.paged_kv_block_size:
-            sequence_length, batch_size, _ = hidden_states.shape
-            num_blocks = math.ceil(sequence_length  / self.paged_kv_block_size) * batch_size
-            block_table = rearrange(
-                torch.randperm(num_blocks, dtype=torch.int32, device=get_accelerator().device_name()),
-                "(b nblocks) -> b nblocks",
-                b=batch_size,
-            )
-            return block_table
-        return None
-
     def forward(self, hidden_states, attention_mask=None,
                 encoder_output=None, enc_dec_attn_mask=None,
                 retriever_input=None,
@@ -1247,16 +1244,13 @@ class ParallelTransformerLayer(MegatronModule):
         # Layer norm at the beginning of the transformer layer.
         layernorm_output = self.input_layernorm(hidden_states)
 
-        block_table = self.compute_block_table(hidden_states)
-
         # Self attention.
         attention_output, attention_bias = \
             self.self_attention(
                 layernorm_output,
                 attention_mask,
                 inference_params=inference_params,
-                rotary_pos_emb=rotary_pos_emb,
-                block_table=block_table
+                rotary_pos_emb=rotary_pos_emb
             )
 
         # Residual connection.
