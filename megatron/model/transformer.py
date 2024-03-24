@@ -466,6 +466,8 @@ class FlashSelfAttention(torch.nn.Module):
             dropout_p = 0
 
         #TODO Implement Block table
+
+
         output = self.flash_attn_func(
             q, k, v, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen_k,
             dropout_p,
@@ -655,7 +657,7 @@ class ParallelAttention(MegatronModule):
             skip_bias_add=True)
 
         # Sliding Window Attention
-        self.window_size = config.window_size
+        self.window_size = (config.window_size, config.window_size)
         # Paged Attention
         self.block_table = block_table
 
@@ -939,7 +941,7 @@ class ParallelTransformerLayer(MegatronModule):
     def __init__(self, config,
                  layer_number, layer_type=LayerType.encoder,
                  self_attn_mask_type=AttnMaskType.padding,
-                 drop_path_rate=0., num_experts=1, paged_kv_block_size=256):
+                 drop_path_rate=0., num_experts=1):
         # retriever=None):
         args = get_args()
 
@@ -971,7 +973,7 @@ class ParallelTransformerLayer(MegatronModule):
             self.input_layernorm = RMSNorm(config.hidden_size, config.layernorm_epsilon)
         # Self attention.
         # set paged_kv_block_size
-        self.paged_kv_block_size = paged_kv_block_size
+        self.paged_kv_block_size = config.paged_kv_block_size
         self.self_attention = ParallelAttention(
             config,
             layer_number,
@@ -1279,14 +1281,16 @@ class ParallelTransformerLayer(MegatronModule):
         return retriever_output, layernorm_input, layernorm_output
 
     def compute_block_table(self, hidden_states):
-        sequence_length, batch_size, _ = hidden_states.shape
-        num_blocks = math.ceil(sequence_length  / self.paged_kv_block_size) * batch_size * 3
-        block_table = rearrange(
-            torch.randperm(num_blocks, dtype=torch.int32, device=get_accelerator().device_name()),
-            "(b nblocks) -> b nblocks",
-            b=batch_size,
-        )
-        return block_table
+        if self.paged_kv_block_size:
+            sequence_length, batch_size, _ = hidden_states.shape
+            num_blocks = math.ceil(sequence_length  / self.paged_kv_block_size) * batch_size
+            block_table = rearrange(
+                torch.randperm(num_blocks, dtype=torch.int32, device=get_accelerator().device_name()),
+                "(b nblocks) -> b nblocks",
+                b=batch_size,
+            )
+            return block_table
+        return None
 
     def forward(self, hidden_states, attention_mask=None,
                 encoder_output=None, enc_dec_attn_mask=None,
