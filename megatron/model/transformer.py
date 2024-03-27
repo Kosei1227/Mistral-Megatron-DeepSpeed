@@ -623,7 +623,8 @@ class ParallelAttention(MegatronModule):
             skip_bias_add=True)
 
         # Sliding Window Attention
-        self.window_size = (config.window_size, config.window_size)
+        # assuming that config.window_size is tuple/list
+        self.window_size = config.window_size
 
     def _checkpointed_attention_forward(self, query_layer, key_layer,
                                         value_layer, attention_mask,
